@@ -5,12 +5,11 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use colored::Colorize;
 use ed25519_dalek::{Signer as _, SigningKey};
-use prettytable::{Cell, Row, Table};
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use stellar_xdr::curr::{
-    ContractId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, Limits, ScAddress,
-    ScBytes, ScMap, ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry,
+    ContractId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, Limits, PublicKey,
+    ScAddress, ScBytes, ScMap, ScVal, ScVec, SorobanAddressCredentials, SorobanAuthorizationEntry,
     SorobanAuthorizedInvocation, SorobanCredentials, VecM, WriteXdr,
 };
 
@@ -112,34 +111,49 @@ async fn collect_signatures(
 ) -> Result<Vec<(ScVal, ScVal)>> {
     let mut signatures = Vec::new();
 
-    for signer in signers {
+    for (i, signer) in signers.iter().enumerate() {
+        let signer_type = signer.signer_type.to_string();
+        let address_str = match &signer.address {
+            ScAddress::Contract(contract_id) => {
+                stellar_strkey::Contract(contract_id.0.clone().into()).to_string()
+            }
+            ScAddress::Account(account_id) => match &account_id.0 {
+                PublicKey::PublicKeyTypeEd25519(uint256) => {
+                    stellar_strkey::ed25519::PublicKey(uint256.0).to_string()
+                }
+            },
+            _ => "Unsupported address type".to_string(),
+        };
+
+        // Box header
+        let box_width = 100;
+        eprintln!();
         eprintln!(
-            "\n{}",
-            "┌─────────────────────────────────────────────────────────┐".bright_yellow()
+            "{}",
+            format!("+-{:-<width$}-+", "", width = box_width).yellow()
         );
         eprintln!(
             "{}",
-            "│ Signer Required                                         │".bright_yellow()
+            format!("| {:<width$} |", format!("Signer {i}",), width = box_width).yellow()
         );
         eprintln!(
             "{}",
-            "└─────────────────────────────────────────────────────────┘".bright_yellow()
+            format!("+-{:-<width$}-+", "", width = box_width).yellow()
         );
 
-        let mut signer_table = Table::new();
-        signer_table.add_row(Row::new(vec![
-            Cell::new("Type"),
-            Cell::new(&signer.signer_type.to_string()),
-        ]));
-        signer_table.add_row(Row::new(vec![
-            Cell::new("Verifier Contract"),
-            Cell::new(&stellar_strkey::Contract(signer.contract_id.0.clone().into()).to_string()),
-        ]));
-        signer_table.add_row(Row::new(vec![
-            Cell::new("Public Key"),
-            Cell::new(&hex::encode(&signer.public_key.0)),
-        ]));
-        signer_table.printstd();
+        eprintln!("{}  {}", "Type:".bright_white(), signer_type.green());
+        eprintln!("{}  {}", "Address:".bright_white(), address_str);
+        if let Some(ref pubkey) = signer.public_key {
+            eprintln!(
+                "{}  {}",
+                "Public Key:".bright_white(),
+                hex::encode(&pubkey.0).bright_black()
+            );
+        }
+        eprintln!(
+            "{}",
+            format!("+-{:-<width$}-+", "", width = box_width).yellow()
+        );
 
         eprintln!(
             "\n{}",
@@ -188,7 +202,14 @@ async fn sign_with_web_passkey(
     eprintln!("\nA browser window will open for you to authenticate.");
     eprintln!("Use your registered passkey (fingerprint, Face ID, or security key).");
 
-    let public_key = signer.public_key.0.as_slice();
+    let public_key = signer
+        .public_key
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Passkey signing requires a public key, but none was provided")
+        })?
+        .0
+        .as_slice();
     let pubkey_hex = hex::encode(public_key);
 
     eprintln!("\n{}", "Authentication details:".bright_white().bold());
@@ -277,22 +298,24 @@ fn sign_with_ed25519(signer: &ContextSigner, payload_hash: &[u8]) -> Result<(ScV
     let signing_key = SigningKey::from_bytes(&key_array);
     let verifying_key = signing_key.verifying_key();
 
-    if verifying_key.to_bytes() != signer.public_key.0.as_slice() {
-        eprintln!(
-            "\n{}",
-            "❌ Error: The private key does not match the expected public key."
-                .red()
-                .bold()
-        );
-        eprintln!(
-            "Expected public key: {}",
-            hex::encode(&signer.public_key.0).cyan()
-        );
-        eprintln!(
-            "Derived public key: {}",
-            hex::encode(verifying_key.to_bytes()).red()
-        );
-        anyhow::bail!("Private key and public key mismatch");
+    if let Some(ref expected_pubkey) = signer.public_key {
+        if verifying_key.to_bytes() != expected_pubkey.0.as_slice() {
+            eprintln!(
+                "\n{}",
+                "❌ Error: The private key does not match the expected public key."
+                    .red()
+                    .bold()
+            );
+            eprintln!(
+                "Expected public key: {}",
+                hex::encode(&expected_pubkey.0).cyan()
+            );
+            eprintln!(
+                "Derived public key: {}",
+                hex::encode(verifying_key.to_bytes()).red()
+            );
+            anyhow::bail!("Private key and public key mismatch");
+        }
     }
 
     let signature = signing_key.sign(payload_hash);

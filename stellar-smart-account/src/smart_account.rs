@@ -3,25 +3,15 @@
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use prettytable::{Cell, Row, Table};
 use serde::Serialize;
 use std::io::{self, Write};
 use stellar_rpc_client::Client;
 use stellar_xdr::curr::{
     ContractId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, Limits, Memo,
-    MuxedAccount, Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScBytes, ScMap,
-    ScMapEntry, ScString, ScSymbol, ScVal, ScVec, SequenceNumber, StringM, Transaction,
+    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScBytes,
+    ScMap, ScMapEntry, ScString, ScSymbol, ScVal, ScVec, SequenceNumber, StringM, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
 };
-
-/// Truncate a string to format: XXXXXXXXXX...XXXXXXXXXX
-fn truncate_value(s: &str, prefix_len: usize, suffix_len: usize) -> String {
-    if s.len() <= prefix_len + suffix_len + 3 {
-        s.to_string()
-    } else {
-        format!("{}...{}", &s[..prefix_len], &s[s.len() - suffix_len..])
-    }
-}
 
 // Field name constants for type-safe parsing
 const FIELD_CONTEXT_TYPE: &str = "context_type";
@@ -44,8 +34,8 @@ pub struct ContextRule {
 #[derive(Serialize, Clone, Debug)]
 pub struct Signer {
     pub signer_type: StringM<32>,
-    pub contract_id: ContractId,
-    pub public_key: ScBytes,
+    pub address: ScAddress,
+    pub public_key: Option<ScBytes>,
     pub signer_vec: VecM<ScVal>,
 }
 
@@ -149,89 +139,130 @@ pub async fn get_context_rules_table(
 }
 
 fn display_rules_table(rules: &[ContextRule]) {
-    let mut table = Table::new();
-
-    table.add_row(Row::new(vec![
-        Cell::new("ID"),
-        Cell::new("Name"),
-        Cell::new("Context Type"),
-        Cell::new("Signers"),
-        Cell::new("Policies"),
-        Cell::new("Valid Until"),
-    ]));
+    eprintln!("\n{}", "Available Context Rules:".bright_white().bold());
+    eprintln!(
+        "{}\n",
+        "Each rule defines a different authorization context.".bright_black()
+    );
 
     for rule in rules {
         let id_str = rule
             .id
             .map(|i| i.to_string())
-            .unwrap_or_else(|| "N/A".to_string());
-        let name_str = rule.name.clone().unwrap_or_else(|| "N/A".to_string());
+            .unwrap_or_else(|| "?".to_string());
+        let name_str = rule.name.clone().unwrap_or_else(|| "Unnamed".to_string());
         let context_type_str = rule
             .context_type
             .clone()
             .unwrap_or_else(|| "N/A".to_string());
 
-        let signers_str = if rule.signers.is_empty() {
-            "None".to_string()
+        // Box header
+        let header = format!("Rule #{}: {}", id_str, name_str);
+        let box_width = 100;
+        eprintln!(
+            "{}",
+            format!("+-{:-<width$}-+", "", width = box_width).cyan()
+        );
+        eprintln!(
+            "{}",
+            format!("| {:<width$} |", header, width = box_width).cyan()
+        );
+        eprintln!(
+            "{}",
+            format!("+-{:-<width$}-+", "", width = box_width).cyan()
+        );
+
+        // Context type
+        eprintln!(
+            "{}  {}",
+            "Context:".bright_white(),
+            context_type_str.yellow()
+        );
+
+        // Signers
+        if rule.signers.is_empty() {
+            eprintln!("{}  {}", "Signers:".bright_white(), "None".bright_black());
         } else {
-            let mut signer_lines = Vec::new();
+            let signer_count = rule.signers.len();
+            let external_count = rule
+                .signers
+                .iter()
+                .filter(|s| s.signer_type.to_string() == "External")
+                .count();
+            let delegated_count = signer_count - external_count;
+
+            let summary = match (external_count, delegated_count) {
+                (e, 0) => format!("{} External", e),
+                (0, d) => format!("{} Delegated", d),
+                (e, d) => format!("{} External, {} Delegated", e, d),
+            };
+            eprintln!("{}  {}", "Signers:".bright_white(), summary.green());
+
             for signer in rule.signers.iter() {
                 let signer_type = signer.signer_type.to_string();
 
+                let addr_str = match &signer.address {
+                    ScAddress::Contract(contract_id) => {
+                        stellar_strkey::Contract(contract_id.0.clone().into()).to_string()
+                    }
+                    ScAddress::Account(account_id) => match &account_id.0 {
+                        PublicKey::PublicKeyTypeEd25519(uint256) => {
+                            stellar_strkey::ed25519::PublicKey(uint256.0).to_string()
+                        }
+                    },
+                    _ => "Unsupported".to_string(),
+                };
                 if signer_type == "External" {
-                    let verifier =
-                        stellar_strkey::Contract(signer.contract_id.0.clone().into()).to_string();
-                    let pubkey = hex::encode(&signer.public_key.0);
-                    signer_lines.push(format!(
-                        "• External\n  Verifier: {}\n  PubKey: {}",
-                        verifier,
-                        truncate_value(&pubkey, 10, 10)
-                    ));
+                    let pubkey_str = signer
+                        .public_key
+                        .as_ref()
+                        .map(|pk| hex::encode(&pk.0))
+                        .unwrap_or_else(|| "N/A".to_string());
+                    eprintln!(
+                        "    {} {} {}",
+                        "External:".bright_black(),
+                        format!("({})", addr_str).bright_black(),
+                        pubkey_str,
+                    );
                 } else {
-                    let address =
-                        stellar_strkey::Contract(signer.contract_id.0.clone().into()).to_string();
-                    signer_lines.push(format!("• Delegated\n  Address: {}", address));
+                    eprintln!("    {} {}", "Delegated:".bright_black(), addr_str);
                 }
             }
-            signer_lines.join("\n")
-        };
+        }
 
-        let policies_str = if rule.policies.is_empty() {
-            "None".to_string()
+        // Policies
+        if rule.policies.is_empty() {
+            eprintln!("{}  {}", "Policies:".bright_white(), "None".bright_black());
         } else {
-            rule.policies
+            let policies_str = rule
+                .policies
                 .iter()
-                .map(|policy| {
-                    let address = stellar_strkey::Contract(policy.0.clone().into()).to_string();
-                    format!("• {}", address)
-                })
+                .map(|policy| stellar_strkey::Contract(policy.0.clone().into()).to_string())
                 .collect::<Vec<_>>()
-                .join("\n")
-        };
+                .join(", ");
+            eprintln!("{}  {}", "Policies:".bright_white(), policies_str);
+        }
 
+        // Valid until
         let valid_until_str = rule
             .valid_until
             .clone()
-            .unwrap_or_else(|| "None".to_string());
+            .unwrap_or_else(|| "Never".to_string());
+        eprintln!(
+            "{}  {}",
+            "Expires:".bright_white(),
+            valid_until_str.bright_black()
+        );
 
-        table.add_row(Row::new(vec![
-            Cell::new(&id_str),
-            Cell::new(&name_str),
-            Cell::new(&context_type_str),
-            Cell::new(&signers_str),
-            Cell::new(&policies_str),
-            Cell::new(&valid_until_str),
-        ]));
+        eprintln!(
+            "{}",
+            format!("+-{:-<width$}-+", "", width = box_width).cyan()
+        );
+        eprintln!();
     }
 
-    eprintln!("\n{}\n", "Available Context Rules:".bright_white().bold());
-    table.printstd();
     eprintln!(
-        "\n{}",
-        "Each rule defines a different authorization context.".bright_black()
-    );
-    eprintln!(
-        "{}\n",
+        "{}",
         "Signers listed must provide signatures for the transaction.".bright_black()
     );
 }
@@ -283,10 +314,26 @@ fn extract_values(scmap: &ScMap) -> ContextRule {
             FIELD_CONTEXT_TYPE => {
                 context_type = match val {
                     ScVal::Vec(Some(ScVec(values))) => {
-                        values.as_slice().first().and_then(|v| match v {
+                        let type_name = values.as_slice().first().and_then(|v| match v {
                             ScVal::Symbol(ScSymbol(s)) => Some(s.to_string()),
                             _ => None,
-                        })
+                        });
+
+                        // Check for optional second parameter (ContractId)
+                        let contract_param = values.as_slice().get(1).and_then(|v| match v {
+                            ScVal::Address(ScAddress::Contract(contract_id)) => Some(
+                                stellar_strkey::Contract(contract_id.0.clone().into()).to_string(),
+                            ),
+                            _ => None,
+                        });
+
+                        match (type_name, contract_param) {
+                            (Some(name), Some(contract)) => {
+                                Some(format!("{} ({})", name, contract))
+                            }
+                            (Some(name), None) => Some(name),
+                            _ => None,
+                        }
                     }
                     _ => None,
                 };
@@ -329,21 +376,20 @@ fn extract_values(scmap: &ScMap) -> ContextRule {
                                 return None;
                             };
 
-                            let contract_id = match inner.as_slice()[1].clone() {
-                                ScVal::Address(ScAddress::Contract(id)) => id,
-                                // TODO: G-accounts
-                                //ScVal::Address(ScAddress::Account(id)) => id,
+                            let address = match inner.as_slice().get(1)? {
+                                ScVal::Address(addr) => addr.clone(),
                                 _ => return None,
                             };
 
-                            let ScVal::Bytes(public_key) = &inner.as_slice()[2] else {
-                                return None;
-                            };
+                            let public_key = inner.as_slice().get(2).and_then(|val| match val {
+                                ScVal::Bytes(bytes) => Some(bytes.clone()),
+                                _ => None,
+                            });
 
                             Some(Signer {
                                 signer_type: signer_type.clone(),
-                                contract_id,
-                                public_key: public_key.clone(),
+                                address,
+                                public_key,
                                 signer_vec: inner.clone(),
                             })
                         })
@@ -351,7 +397,10 @@ fn extract_values(scmap: &ScMap) -> ContextRule {
                 }
             }
             FIELD_VALID_UNTIL => {
-                valid_until = Some(format!("{:?}", val));
+                valid_until = match val {
+                    ScVal::Void => None,
+                    _ => Some(format!("{:?}", val)),
+                };
             }
             _ => {}
         }
