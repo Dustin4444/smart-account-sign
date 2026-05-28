@@ -38,8 +38,6 @@ const useThrottleCallback = <Params extends unknown[], Return>(
   )
 }
 
-const supabase = createClient()
-
 const generateRandomColor = () => `hsl(${Math.floor(Math.random() * 360)}, 100%, 70%)`
 
 const generateRandomNumber = () => Math.floor(Math.random() * 100)
@@ -106,6 +104,7 @@ export const useRealtimeCursors = ({
   const handleMouseMove = useThrottleCallback(callback, throttleMs)
 
   useEffect(() => {
+    const supabase = createClient()
     const channel = supabase.channel(roomName)
 
     channel
